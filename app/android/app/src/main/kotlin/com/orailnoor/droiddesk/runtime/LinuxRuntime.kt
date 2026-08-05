@@ -91,6 +91,32 @@ class LinuxRuntime(private val context: Context) {
     /** Qualcomm exposes the Adreno render device through KGSL on Android. */
     private fun hasAdrenoGpu(): Boolean = File("/dev/kgsl-3d0").exists()
 
+    /**
+     * ARM Mali/Immortalis GPUs, identified via system properties rather than a
+     * device node: Mali is a 3D-only core reached through /dev/dri on Linux,
+     * but that node is not exposed to a non-root Android app process, so
+     * presence/absence of a device file can't be used here the way it is for
+     * Adreno's KGSL node above.
+     */
+    private fun hasMaliGpu(): Boolean {
+        val props = listOf(
+            getSystemProperty("ro.hardware.egl"),
+            getSystemProperty("ro.hardware.vulkan"),
+            getSystemProperty("ro.hardware"),
+            getSystemProperty("ro.board.platform"),
+            getSystemProperty("ro.chipname"),
+        ).joinToString(" ").lowercase()
+        return listOf("mali", "panfrost", "exynos", "mt6", "mt8", "kirin", "unisoc")
+            .any { it in props }
+    }
+
+    private fun getSystemProperty(name: String): String = try {
+        val process = ProcessBuilder("getprop", name).redirectErrorStream(true).start()
+        process.inputStream.bufferedReader().readText().trim().also { process.waitFor() }
+    } catch (e: Exception) {
+        ""
+    }
+
     private fun normalizedDesktop(desktopEnv: String): String = when (desktopEnv.lowercase()) {
         "lxqt", "mate", "kde", "xfce4" -> desktopEnv.lowercase()
         else -> "xfce4"
@@ -117,20 +143,54 @@ class LinuxRuntime(private val context: Context) {
 
     fun getGraphicsMode(): String {
         val freedrenoIcd = File(prefixDir, "share/vulkan/icd.d/freedreno_icd.aarch64.json")
-        return if (hasAdrenoGpu() && freedrenoIcd.exists()) {
-            "Turnip + Zink"
-        } else {
-            "Software (llvmpipe)"
+        if (hasAdrenoGpu() && freedrenoIcd.exists()) {
+            return "Turnip + Zink"
         }
+        val angleLib = File(prefixDir, "opt/angle-android/vulkan/libEGL.so.1")
+        if (hasMaliGpu() && angleLib.exists()) {
+            // Non-root process: real PanVK/Panfrost needs /dev/dri, which is not
+            // reachable here, so hardware accel on Mali goes through the ANGLE
+            // GL-on-Vulkan translation layer instead (per-app, not desktop-wide).
+            return "ANGLE + Vulkan (Mali, experimental)"
+        }
+        return "Software (llvmpipe)"
     }
 
     fun getOptionalAppsStatus(): Map<String, Boolean> = mapOf(
+        // ── Development ──
         "firefox" to File(binDir, "firefox").exists(),
         "code_oss" to (File(binDir, "code-oss").exists() || File(binDir, "code").exists()),
         "nodejs" to (File(binDir, "node").exists() && File(binDir, "npm").exists()),
+        "python3_dev" to (File(binDir, "python3").exists() && File(binDir, "pip3").exists()),
+        "neovim" to (File(binDir, "nvim").exists()),
+        // ── Gaming (run inside Debian PRoot) ──
+        "steam_native" to isDebianPackageInstalled("steam-installer"),
+        "box64" to isDebianPackageInstalled("box64"),
+        "wine_arm64" to isDebianPackageInstalled("wine"),
+        "lutris" to isDebianPackageInstalled("lutris"),
+        // ── Media & Graphics ──
         "imagemagick" to (File(binDir, "magick").exists() || File(binDir, "convert").exists()),
+        "vlc" to (File(binDir, "vlc").exists()),
+        "gimp" to (File(binDir, "gimp").exists()),
+        "ffmpeg" to (File(binDir, "ffmpeg").exists()),
+        // ── Productivity ──
+        "libreoffice" to isDebianPackageInstalled("libreoffice"),
+        // ── System ──
+        "mali_accel" to (hasMaliGpu() && File(prefixDir, "opt/angle-android/vulkan/libEGL.so.1").exists()),
+        "htop" to (File(binDir, "htop").exists()),
         "proot_debian" to isMinimalDebianInstalled(),
     )
+
+    /** Check whether a package is installed inside the Debian PRoot rootfs. */
+    private fun isDebianPackageInstalled(packageName: String): Boolean {
+        if (!isMinimalDebianInstalled()) return false
+        // proot-distro runs dpkg-query inside the Debian container
+        val out = executeCommand(
+            "proot-distro login debian -- " +
+            "dpkg-query -W -f='\${Status}' $packageName 2>/dev/null"
+        )
+        return out.trim() == "install ok installed"
+    }
 
     private fun isMinimalDebianInstalled(): Boolean {
         val installed = debianRootfsMarkers().any(File::exists) &&
@@ -1100,6 +1160,62 @@ class LinuxRuntime(private val context: Context) {
         return true
     }
 
+    /**
+     * Fetches and installs the mesa-vulkan-icd-wrapper .deb that lets ANGLE
+     * find Mali's Vulkan driver. Third-party binary from
+     * github.com/ar37-rs/virgl-angle — the asset filename is version-stamped
+     * and changes between releases, so it's resolved through the GitHub
+     * Releases API rather than hardcoded. Best-effort: any failure leaves the
+     * system on software rendering rather than aborting the caller.
+     */
+    private fun installMaliAngleWrapper(): Boolean {
+        val repo = "ar37-rs/virgl-angle"
+        installPackageGroup("pkg install -y curl")
+
+        val apiOutput = executeCommand(
+            "curl -fsSL https://api.github.com/repos/$repo/releases/tags/latest"
+        )
+        if (apiOutput.startsWith("Error:")) {
+            Log.w(TAG, "Mali ANGLE: GitHub API request failed")
+            return false
+        }
+
+        val debUrl = Regex(
+            "\"browser_download_url\":\\s*\"([^\"]*mesa-vulkan-icd-wrapper[^\"]*\\.deb)\""
+        ).find(apiOutput)?.groupValues?.get(1)
+        if (debUrl.isNullOrBlank()) {
+            Log.w(TAG, "Mali ANGLE: could not resolve wrapper .deb URL from release metadata")
+            return false
+        }
+
+        val tmpDeb = "/data/data/com.termux/files/usr/tmp/mesa-vulkan-icd-wrapper.deb"
+        val downloadResult = executeCommand("curl -fsSL \"$debUrl\" -o \"$tmpDeb\"")
+        if (downloadResult.startsWith("Error:")) {
+            Log.w(TAG, "Mali ANGLE: download failed")
+            return false
+        }
+
+        // Sanity check: a real .deb is an ar archive, not an HTML error page.
+        val fileCheck = executeCommand("file \"$tmpDeb\"")
+        if (!fileCheck.contains("Debian binary package", ignoreCase = true) &&
+            !fileCheck.contains("ar archive", ignoreCase = true)
+        ) {
+            Log.w(TAG, "Mali ANGLE: downloaded file failed validation, not installing")
+            executeCommand("rm -f \"$tmpDeb\"")
+            return false
+        }
+
+        val installResult = executeCommand("dpkg -i \"$tmpDeb\"")
+        executeCommand("rm -f \"$tmpDeb\"")
+        if (installResult.startsWith("Error:")) {
+            Log.w(TAG, "Mali ANGLE: dpkg install of wrapper failed")
+            return false
+        }
+
+        Log.i(TAG, "Mali ANGLE ICD wrapper installed")
+        return true
+    }
+
     private fun installPackageGroup(cmd: String): Boolean {
         // pkg install downloads, unpacks and configures in one go. Newly unpacked
         // maintainer scripts still contain the original Termux shebang, so after
@@ -1243,6 +1359,81 @@ class LinuxRuntime(private val context: Context) {
     }
 
     /** Installs only PRoot, proot-distro and Debian's base rootfs. */
+    // ── Debian PRoot helpers ─────────────────────────────────────────────────
+
+    /** Thin wrapper: run a shell command inside the Debian PRoot container. */
+    /**
+     * Run a shell command inside the Debian PRoot container.
+     *
+     * proot-distro requires PROOT_LOADER / PROOT_TMP_DIR env vars and a /tmp
+     * bind identical to writeDebianLauncher; without them proot cannot find the
+     * guest interpreter and raises "execve /usr/bin/bash: No such file".
+     */
+    private fun executeDebianCommand(cmd: String): String {
+        val proofDir = File(tmpDir, "proot").also { it.mkdirs() }
+        val loaderPath = File(prefixDir, "libexec/proot/loader").absolutePath
+        val loader32Path = File(prefixDir, "libexec/proot/loader32").absolutePath
+        val pdBin = File(binDir, "proot-distro").absolutePath
+        val escapedCmd = cmd.replace("'", "'\''")
+        return executeCommand(
+            "PROOT_TMP_DIR='${proofDir.absolutePath}' " +
+            "PROOT_LOADER='$loaderPath' " +
+            "PROOT_LOADER_32='$loader32Path' " +
+            "$pdBin login debian " +
+            "--bind '${tmpDir.absolutePath}:/tmp' " +
+            "-- sh -c '$escapedCmd'"
+        )
+    }
+
+    /** apt-get install inside Debian PRoot, with a retry after apt-get update. */
+    private fun installDebianPackages(packages: List<String>): Boolean {
+        if (packages.isEmpty()) return true
+        val names = packages.joinToString(" ")
+        fun attempt(): Boolean {
+            val out = executeDebianCommand("DEBIAN_FRONTEND=noninteractive apt-get install -y $names 2>&1")
+            return packages.all { pkg ->
+                val status = executeDebianCommand("dpkg-query -W -f='\${Status}' $pkg 2>/dev/null")
+                status.trim() == "install ok installed"
+            }
+        }
+        if (attempt()) return true
+        executeDebianCommand("apt-get update -qq")
+        return attempt()
+    }
+
+    /** DSL step used by [installInDebian]. */
+    private data class DebianStep(
+        val progress: Double,
+        val label: String,
+        val run: LinuxRuntime.() -> Boolean,
+    )
+
+    /**
+     * Orchestrates a multi-step install of a gaming / Debian-hosted app.
+     * Always verifies that the Debian PRoot rootfs is present first.
+     */
+    private fun installInDebian(
+        appId: String,
+        displayName: String,
+        steps: List<DebianStep>,
+        onProgress: ((Double, String) -> Unit)? = null,
+    ): Boolean {
+        if (!isMinimalDebianInstalled()) {
+            onProgress?.invoke(-1.0,
+                "Debian (PRoot) is required. Install it first from the System category.")
+            return false
+        }
+        onProgress?.invoke(0.10, "Entering Debian environment...")
+        for (step in steps) {
+            onProgress?.invoke(step.progress, step.label)
+            if (!step.run(this)) {
+                onProgress?.invoke(-1.0, "$displayName install step failed: ${step.label}")
+                return false
+            }
+        }
+        return true
+    }
+
     private fun installMinimalDebian(
         onProgress: ((Double, String) -> Unit)? = null,
     ): Boolean {
@@ -1280,6 +1471,7 @@ class LinuxRuntime(private val context: Context) {
 
     fun installDesktopEnvironmentNative(
         desktopEnv: String = "xfce4",
+        enableExperimentalMaliAccel: Boolean = false,
         onProgress: ((Double, String) -> Unit)? = null,
     ): Boolean {
         val selectedDesktop = normalizedDesktop(desktopEnv)
@@ -1359,6 +1551,26 @@ class LinuxRuntime(private val context: Context) {
         if (hasAdrenoGpu()) {
             onProgress?.invoke(0.78, "Installing Adreno hardware acceleration...")
             installPackageGroup("pkg install -y mesa-vulkan-icd-freedreno")
+        } else if (hasMaliGpu() && enableExperimentalMaliAccel) {
+            // Native PanVK/Panfrost need /dev/dri, which this app-private,
+            // non-root userspace can never reach, so there is no package-only
+            // hardware path here the way there is for Adreno above. The
+            // community-verified workaround is ANGLE translating GL calls to
+            // Mali's (working) Vulkan driver, applied per-app rather than
+            // desktop-wide so a bad launch can't take the session down.
+            //
+            // This pulls third-party binaries from github.com/ar37-rs/virgl-angle
+            // (not an official Mesa/Termux package, not maintained by DroidDesk),
+            // so it is opt-in only — callers must explicitly pass
+            // enableExperimentalMaliAccel = true, normally after the user
+            // confirms this in the UI. Any failure here is non-fatal; setup
+            // continues on software rendering.
+            onProgress?.invoke(0.78, "Installing experimental Mali acceleration...")
+            installPackageGroup("pkg install -y virglrenderer virglrenderer-android angle-android vulkan-loader-generic")
+            installPackageGroup("pkg uninstall -y mesa-vulkan-icd-swrast")
+            if (!installMaliAngleWrapper()) {
+                Log.w(TAG, "Mali ANGLE ICD wrapper unavailable; Mali apps will use software rendering")
+            }
         }
 
         val nativeTools = "git wget curl openssh htop python clang"
@@ -1403,6 +1615,7 @@ class LinuxRuntime(private val context: Context) {
         if (!installPackageGroup("dpkg --configure -a")) return false
 
         val ok = when (appId) {
+            // ── Development ──────────────────────────────────────────────────
             "firefox" -> {
                 onProgress?.invoke(0.25, "Installing Firefox...")
                 installOptionalPackages(listOf("firefox"), onProgress, 0.55)
@@ -1418,9 +1631,132 @@ class LinuxRuntime(private val context: Context) {
                 onProgress?.invoke(0.65, "Installing npm...")
                 installOptionalPackages(listOf("npm"), onProgress, 0.78)
             }
+            "python3_dev" -> {
+                onProgress?.invoke(0.25, "Installing Python 3 + pip...")
+                installOptionalPackages(listOf("python3", "python3-pip"), onProgress, 0.60) && run {
+                    onProgress?.invoke(0.75, "Installing common Python libraries...")
+                    // Non-fatal: installs numpy, requests; skip on failure
+                    installOptionalPackages(listOf("python3-numpy", "python3-requests"), onProgress, 0.90)
+                    true
+                }
+            }
+            "neovim" -> {
+                onProgress?.invoke(0.25, "Installing Neovim...")
+                installOptionalPackages(listOf("neovim"), onProgress, 0.65)
+            }
+            // ── Gaming (Debian PRoot) ─────────────────────────────────────────
+            "steam_native" -> installInDebian(
+                appId = "steam_native",
+                displayName = "Steam (Native ARM64)",
+                steps = listOf(
+                    // Enable non-free + contrib for Steam
+                    DebianStep(0.22, "Enabling non-free repositories...") {
+                        executeDebianCommand(
+                            "sed -i 's/^deb \\(.*\\) bookworm main$/deb \\1 bookworm main contrib non-free non-free-firmware/' /etc/apt/sources.list && apt-get update -qq"
+                        )
+                        true
+                    },
+                    DebianStep(0.40, "Installing Steam prerequisites...") {
+                        installDebianPackages(listOf("wget", "ca-certificates", "libgl1-mesa-dri"))
+                    },
+                    DebianStep(0.60, "Installing Steam (ARM64 native)...") {
+                        // steam-installer is available in Debian bookworm non-free for arm64
+                        installDebianPackages(listOf("steam-installer"))
+                    },
+                ),
+                onProgress = onProgress,
+            )
+            "box64" -> installInDebian(
+                appId = "box64",
+                displayName = "Box64",
+                steps = listOf(
+                    DebianStep(0.22, "Adding Box64 apt repository...") {
+                        // Official Box64 Debian repo (Pi / ARM64)
+                        val addRepo = executeDebianCommand(
+                            "wget -qO /etc/apt/keyrings/box64.gpg " +
+                            "https://ryanfortner.github.io/box64-debs/box64.gpg && " +
+                            "echo 'deb [signed-by=/etc/apt/keyrings/box64.gpg] " +
+                            "https://ryanfortner.github.io/box64-debs/ ./' " +
+                            "> /etc/apt/sources.list.d/box64.list && " +
+                            "apt-get update -qq"
+                        )
+                        !addRepo.startsWith("Error:")
+                    },
+                    DebianStep(0.60, "Installing Box64...") {
+                        installDebianPackages(listOf("box64-arm64"))
+                    },
+                ),
+                onProgress = onProgress,
+            )
+            "wine_arm64" -> installInDebian(
+                appId = "wine_arm64",
+                displayName = "Wine (ARM64)",
+                steps = listOf(
+                    DebianStep(0.22, "Installing Wine dependencies...") {
+                        installDebianPackages(listOf("wine", "winetricks", "xdg-utils"))
+                    },
+                    DebianStep(0.80, "Configuring Wine prefix...") {
+                        // Init a Wine prefix silently; non-fatal if display not available
+                        executeDebianCommand("WINEDLLOVERRIDES='mscoree,mshtml=' DISPLAY=:0 wineboot --init 2>/dev/null || true")
+                        true
+                    },
+                ),
+                onProgress = onProgress,
+            )
+            "lutris" -> installInDebian(
+                appId = "lutris",
+                displayName = "Lutris",
+                steps = listOf(
+                    DebianStep(0.22, "Installing Lutris dependencies...") {
+                        installDebianPackages(listOf("python3", "python3-gi", "gir1.2-gtk-3.0",
+                            "gir1.2-webkit2-4.1", "python3-requests", "python3-yaml",
+                            "python3-pillow", "cabextract", "unzip", "curl"))
+                    },
+                    DebianStep(0.55, "Installing Lutris...") {
+                        installDebianPackages(listOf("lutris"))
+                    },
+                ),
+                onProgress = onProgress,
+            )
+            // ── Media & Graphics ─────────────────────────────────────────────
             "imagemagick" -> {
                 onProgress?.invoke(0.25, "Installing ImageMagick...")
                 installOptionalPackages(listOf("imagemagick"), onProgress, 0.55)
+            }
+            "vlc" -> {
+                onProgress?.invoke(0.25, "Installing VLC...")
+                installOptionalPackages(listOf("vlc"), onProgress, 0.65)
+            }
+            "gimp" -> {
+                onProgress?.invoke(0.25, "Installing GIMP...")
+                installOptionalPackages(listOf("gimp"), onProgress, 0.65)
+            }
+            "ffmpeg" -> {
+                onProgress?.invoke(0.25, "Installing FFmpeg...")
+                installOptionalPackages(listOf("ffmpeg"), onProgress, 0.65)
+            }
+            // ── Productivity ─────────────────────────────────────────────────
+            "libreoffice" -> installInDebian(
+                appId = "libreoffice",
+                displayName = "LibreOffice",
+                steps = listOf(
+                    DebianStep(0.20, "Installing LibreOffice (large download, ~600 MB)...") {
+                        installDebianPackages(listOf(
+                            "libreoffice",
+                            "libreoffice-gtk3",
+                            "libreoffice-l10n-en-us",
+                        ))
+                    },
+                ),
+                onProgress = onProgress,
+            )
+            // ── System ───────────────────────────────────────────────────────
+            "htop" -> {
+                onProgress?.invoke(0.25, "Installing system tools...")
+                installOptionalPackages(
+                    listOf("htop", "btop", "neofetch", "lsof"),
+                    onProgress, 0.65
+                )
             }
             "proot_debian" -> installMinimalDebian(onProgress)
             else -> false

@@ -36,6 +36,38 @@ class ChrootRuntime(private val context: Context) {
     private val tmpDir: File get() = File(baseDir, "tmp")
     private val x11HostDir: File get() = File(tmpDir, ".X11-unix")
 
+    /** Qualcomm exposes the Adreno render device through KGSL on Android. */
+    private fun hasAdrenoGpu(): Boolean = File("/dev/kgsl-3d0").exists()
+
+    /**
+     * ARM Mali/Immortalis GPUs, identified via system properties. Unlike
+     * Adreno's KGSL node, Mali has no equivalent fixed device path to probe —
+     * it's reached through the generic DRM /dev/dri/renderD* node, which is
+     * only meaningful once we know to look for it.
+     */
+    private fun hasMaliGpu(): Boolean {
+        val props = listOf(
+            getSystemProperty("ro.hardware.egl"),
+            getSystemProperty("ro.hardware.vulkan"),
+            getSystemProperty("ro.hardware"),
+            getSystemProperty("ro.board.platform"),
+            getSystemProperty("ro.chipname"),
+        ).joinToString(" ").lowercase()
+        return listOf("mali", "panfrost", "exynos", "mt6", "mt8", "kirin", "unisoc")
+            .any { it in props }
+    }
+
+    private fun getSystemProperty(name: String): String = try {
+        val process = ProcessBuilder("getprop", name).redirectErrorStream(true).start()
+        process.inputStream.bufferedReader().readText().trim().also { process.waitFor() }
+    } catch (e: Exception) {
+        ""
+    }
+
+    /** True once the kernel's DRM render node is actually visible (root + driver present). */
+    private fun hasDrmRenderNode(): Boolean =
+        File("/dev/dri").listFiles()?.any { it.name.startsWith("renderD") } == true
+
     // ── Status ──
 
     fun hasRoot(): Boolean = rootShell.hasRoot()
@@ -95,8 +127,34 @@ class ChrootRuntime(private val context: Context) {
             File(rootfsDir, it).mkdirs()
         }
 
-        // Portable software-rendering profile. Android vendor GPU libraries do
-        // not automatically become usable inside an Ubuntu chroot.
+        // Graphics environment. The chroot has real root + a full /dev bind
+        // mount (see ensureMounts), so unlike the non-root app-private runtime,
+        // this path CAN reach /dev/dri/renderD* and use native vendor Vulkan
+        // ICDs (Turnip for Adreno, PanVK for Mali) rather than falling back to
+        // llvmpipe software rendering for every non-Adreno device.
+        val gpuEnvLines = when {
+            hasAdrenoGpu() -> listOf(
+                "# Adreno: Turnip (Vulkan) + Zink (GL-over-Vulkan)",
+                "export GALLIUM_DRIVER=zink",
+                "export MESA_LOADER_DRIVER_OVERRIDE=zink",
+                "export MESA_VK_WSI_PRESENT_MODE=immediate",
+                "export ZINK_DESCRIPTORS=lazy",
+            )
+            hasMaliGpu() && hasDrmRenderNode() -> listOf(
+                "# Mali: PanVK (Vulkan) + Zink (GL-over-Vulkan) — requires root, DRM node present",
+                "export GALLIUM_DRIVER=zink",
+                "export MESA_LOADER_DRIVER_OVERRIDE=zink",
+                "export MESA_VK_WSI_PRESENT_MODE=immediate",
+                "export ZINK_DESCRIPTORS=lazy",
+            )
+            else -> listOf(
+                "# Conservative Mesa fallback: no recognized vendor GPU path available",
+                "export LIBGL_ALWAYS_SOFTWARE=true",
+                "export GALLIUM_DRIVER=llvmpipe",
+                "export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe",
+            )
+        }.joinToString("\n                ")
+
         File(rootfsDir, "etc/profile.d/droiddesk-ha.sh").apply {
             parentFile?.mkdirs()
             writeText(
@@ -109,10 +167,7 @@ class ChrootRuntime(private val context: Context) {
                 export XDG_DATA_DIRS=/usr/share:/usr/local/share
                 export XDG_CONFIG_DIRS=/etc/xdg
 
-                # Conservative Mesa fallback that works across GPU vendors
-                export LIBGL_ALWAYS_SOFTWARE=true
-                export GALLIUM_DRIVER=llvmpipe
-                export MESA_LOADER_DRIVER_OVERRIDE=llvmpipe
+                $gpuEnvLines
 
                 # Disable accessibility bus spam
                 export NO_AT_BRIDGE=1
@@ -190,6 +245,21 @@ class ChrootRuntime(private val context: Context) {
                             "mesa-vulkan-drivers mesa-opencl-icd libgl1-mesa-dri libglx-mesa0 vulkan-tools",
                     onLog
                 ) != 0) Log.w(TAG, "Mesa packages unavailable; desktop will use available software rendering")
+
+                // Ubuntu's mesa-vulkan-drivers metapackage bundles the ICD for
+                // every supported vendor (Adreno/Turnip and Mali/PanVK included),
+                // so no extra vendor-specific package is needed here — the
+                // correct ICD is selected at runtime by the loader based on
+                // VK_ICD_FILENAMES / device match, set in droiddesk-ha.sh above.
+                // We only log what we expect so failures are diagnosable.
+                when {
+                    hasAdrenoGpu() -> Log.i(TAG, "Adreno detected: expecting Turnip Vulkan ICD")
+                    hasMaliGpu() && hasDrmRenderNode() ->
+                        Log.i(TAG, "Mali detected with DRM render node: expecting PanVK Vulkan ICD")
+                    hasMaliGpu() ->
+                        Log.w(TAG, "Mali detected but no /dev/dri/renderD* node visible; falling back to software rendering")
+                    else -> Log.i(TAG, "No recognized vendor GPU; using software rendering")
+                }
 
                 onProgress(0.4, "Installing desktop environment...")
                 val dePackages = when (desktopEnv) {

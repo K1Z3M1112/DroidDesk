@@ -106,18 +106,52 @@ setup_environment() {
     DEVICE_BRAND=$(getprop ro.product.brand 2>/dev/null || echo "Unknown")
     ANDROID_VERSION=$(getprop ro.build.version.release 2>/dev/null || echo "Unknown")
     CPU_ABI=$(getprop ro.product.cpu.abi 2>/dev/null || echo "arm64-v8a")
-    GPU_VENDOR=$(getprop ro.hardware.egl 2>/dev/null || echo "")
+
+    # Probe every prop that tends to carry the real GPU/driver string.
+    # ro.hardware.egl / ro.hardware.vulkan name the *driver* (e.g. "mali", "adreno").
+    # ro.board.platform / ro.chipname / ro.hardware often name the SoC (e.g. "exynos", "mt6983").
+    # Brand is NOT a reliable GPU signal (many Samsung/Xiaomi models ship Exynos+Mali or
+    # MediaTek+Mali, not Snapdragon+Adreno), so it's used only as a last-resort tiebreaker.
+    GPU_PROBE="$(getprop ro.hardware.egl 2>/dev/null) \
+$(getprop ro.hardware.vulkan 2>/dev/null) \
+$(getprop ro.hardware 2>/dev/null) \
+$(getprop ro.board.platform 2>/dev/null) \
+$(getprop ro.chipname 2>/dev/null) \
+$(getprop ro.soc.model 2>/dev/null)"
+    GPU_PROBE_LC=$(echo "$GPU_PROBE" | tr '[:upper:]' '[:lower:]')
+
+    # Root detection — gates which Mali acceleration tier is offered.
+    HAS_ROOT="no"
+    if command -v su > /dev/null 2>&1 && su -c 'id -u' 2>/dev/null | grep -q '^0$'; then
+        HAS_ROOT="yes"
+    fi
 
     echo -e "  [*] Device : ${WHITE}${DEVICE_BRAND} ${DEVICE_MODEL}${NC}"
     echo -e "  [*] Android: ${WHITE}${ANDROID_VERSION}${NC}"
 
-    if [[ "$GPU_VENDOR" == *"adreno"* ]] || \
-       [[ "$DEVICE_BRAND" =~ [Ss]amsung|[Oo]ne[Pp]lus|[Xx]iaomi|[Rr]edmi|[Pp]oco|[Mm]oto|motorola ]]; then
+    if [[ "$GPU_PROBE_LC" == *"adreno"* ]] || [[ "$GPU_PROBE_LC" == *"qcom"* ]]; then
         GPU_DRIVER="freedreno"
-        echo -e "  [*] GPU    : ${WHITE}Adreno — Hardware Acceleration Enabled${NC}"
+        echo -e "  [*] GPU    : ${WHITE}Adreno — Hardware Acceleration Enabled (Turnip)${NC}"
+
+    elif [[ "$GPU_PROBE_LC" == *"mali"* ]] || [[ "$GPU_PROBE_LC" == *"panfrost"* ]] || \
+         [[ "$GPU_PROBE_LC" == *"exynos"* ]] || [[ "$GPU_PROBE_LC" == *"mt6"* ]] || \
+         [[ "$GPU_PROBE_LC" == *"mt8"* ]] || [[ "$GPU_PROBE_LC" == *"kirin"* ]] || \
+         [[ "$GPU_PROBE_LC" == *"unisoc"* ]]; then
+        # Mali/Immortalis GPUs (Exynos, MediaTek Dimensity/Helio, most Kirin, Unisoc) —
+        # covers ARM/Mali-based SoCs regardless of phone brand.
+        if [ "$HAS_ROOT" == "yes" ]; then
+            GPU_DRIVER="panvk"
+            echo -e "  [*] GPU    : ${WHITE}Mali — Hardware Acceleration Enabled (PanVK, root)${NC}"
+        else
+            GPU_DRIVER="mali_angle"
+            echo -e "  [*] GPU    : ${WHITE}Mali — Experimental Hardware Acceleration (ANGLE/Vulkan)${NC}"
+            echo -e "${YELLOW}      [!] Unrooted Mali accel is a community workaround, not an${NC}"
+            echo -e "${YELLOW}          official Mesa driver. It can be unstable on some GPUs.${NC}"
+        fi
+
     else
         GPU_DRIVER="zink_native"
-        echo -e "  [*] GPU    : ${WHITE}Non-Adreno — Zink/LLVMpipe fallback${NC}"
+        echo -e "  [*] GPU    : ${WHITE}Unrecognized GPU — Zink/LLVMpipe (software) fallback${NC}"
         echo -e "${YELLOW}      [!] Recommend XFCE or LXQt for best performance.${NC}"
     fi
     echo ""
@@ -222,10 +256,189 @@ step_gpu() {
     echo -e "${PURPLE}[Step ${CURRENT_STEP}/${TOTAL_STEPS}] Installing GPU Acceleration...${NC}"
     echo ""
     install_pkg "mesa-zink" "Mesa Zink Core"
-    if [ "$GPU_DRIVER" == "freedreno" ]; then
-        install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
-    fi
+
+    case "$GPU_DRIVER" in
+        freedreno)
+            install_pkg "mesa-vulkan-icd-freedreno" "Turnip Adreno Driver"
+            ;;
+        panvk)
+            # Rooted Mali path: native PanVK (Panfrost Vulkan) ICD. This needs
+            # /dev/dri/renderD* which is only reachable with root, so it's
+            # gated behind HAS_ROOT at detection time.
+            install_pkg "mesa-vulkan-icd-panfrost" "PanVK Mali Driver"
+            ;;
+        mali_angle)
+            # Unrooted Mali path: no ICD package can reach /dev/dri without root,
+            # so real acceleration goes through ANGLE translating GL to Mali's
+            # (working) Vulkan driver instead of the broken virgl/GL path.
+            # Installed in step_mali_angle(); nothing further needed here.
+            ;;
+    esac
+
     install_pkg "vulkan-loader-android" "Vulkan Loader"
+
+    if [ "$GPU_DRIVER" == "panvk" ]; then
+        setup_panvk_env
+    elif [ "$GPU_DRIVER" == "mali_angle" ]; then
+        step_mali_angle
+    fi
+}
+
+# ---- Tier A: rooted Mali — native PanVK Vulkan ICD ----
+setup_panvk_env() {
+    echo ""
+    echo -e "  ${CYAN}[*] Configuring PanVK (Mali Vulkan)...${NC}"
+
+    PANVK_ICD="/data/data/com.termux/files/usr/share/vulkan/icd.d/panfrost_icd.aarch64.json"
+    if [ ! -f "$PANVK_ICD" ]; then
+        # Some builds ship it under a termux-specific icd.d.termux path, mirroring
+        # the freedreno layout used elsewhere in this script.
+        ALT_ICD="/data/data/com.termux/files/usr/share/vulkan/icd.d.termux/panfrost_icd.aarch64.json"
+        [ -f "$ALT_ICD" ] && PANVK_ICD="$ALT_ICD"
+    fi
+
+    if [ -f "$PANVK_ICD" ]; then
+        echo -e "  ${GREEN}[+] PanVK ICD found: ${PANVK_ICD}${NC}"
+    else
+        echo -e "  ${YELLOW}[!] PanVK ICD not found on disk yet — it will still be picked up${NC}"
+        echo -e "  ${YELLOW}    automatically at runtime if mesa-vulkan-icd-panfrost installed OK.${NC}"
+    fi
+
+    mkdir -p ~/.config
+    cat > ~/.config/linux-gpu-panvk.sh << PANVKEOF
+# PanVK (Mali Vulkan) + Zink — requires root for /dev/dri access
+export MESA_NO_ERROR=1
+export MESA_GL_VERSION_OVERRIDE=4.6
+export MESA_GLES_VERSION_OVERRIDE=3.2
+export GALLIUM_DRIVER=zink
+export MESA_LOADER_DRIVER_OVERRIDE=zink
+export ZINK_DESCRIPTORS=lazy
+export MESA_VK_WSI_PRESENT_MODE=immediate
+[ -f "$PANVK_ICD" ] && export VK_ICD_FILENAMES="$PANVK_ICD"
+PANVKEOF
+    echo -e "  ${GREEN}[+] Wrote ~/.config/linux-gpu-panvk.sh${NC}"
+}
+
+# ---- Tier B: unrooted Mali — ANGLE translating GL to Mali's Vulkan driver ----
+# Mali's OpenGL-over-virgl path is broken on Termux (texImage2D 0x0502 crash), and
+# native Panfrost/PanVK need /dev/dri which non-root users can't reach. The
+# community-verified workaround is: render through ANGLE (Google's GL-on-Vulkan
+# translator) so calls go straight to Mali's Vulkan driver, bypassing both broken
+# paths. This is NOT an official Mesa/Termux driver — it's third-party binaries
+# from github.com/ar37-rs/virgl-angle, opt-in and clearly labeled as such.
+MALI_ANGLE_REPO="ar37-rs/virgl-angle"
+MALI_ANGLE_ENABLED="no"
+
+step_mali_angle() {
+    echo ""
+    echo -e "  ${CYAN}[*] Mali hardware acceleration (unrooted)${NC}"
+    echo -e "  ${YELLOW}[!] The only working path uses third-party binaries from${NC}"
+    echo -e "  ${YELLOW}    github.com/${MALI_ANGLE_REPO} (not an official Mesa/Termux${NC}"
+    echo -e "  ${YELLOW}    package). DroidDesk does not maintain this project.${NC}"
+    echo ""
+
+    REPLY=""
+    read -p "  Install it and enable experimental Mali GPU accel? [y/N]: " REPLY
+    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
+        echo -e "  ${WHITE}[*] Skipped — apps will use software (LLVMpipe) rendering.${NC}"
+        return
+    fi
+
+    install_pkg "virglrenderer" "VirGL Renderer"
+    install_pkg "virglrenderer-android" "VirGL Renderer (Android)"
+    install_pkg "angle-android" "ANGLE (GL-on-Vulkan)"
+    install_pkg "vulkan-loader-generic" "Generic Vulkan Loader"
+    install_pkg "curl" "cURL"
+    install_pkg "file" "file (deb validation)"
+
+    # Remove the software Vulkan ICD — it silently wins over Mali's real Vulkan
+    # ICD and defeats the whole point of this path.
+    pkg uninstall -y mesa-vulkan-icd-swrast > /dev/null 2>&1 || true
+
+    echo -e "  ${CYAN}[*] Fetching mesa-vulkan-icd-wrapper from ${MALI_ANGLE_REPO}...${NC}"
+    fetch_mali_angle_wrapper
+    if [ $? -ne 0 ]; then
+        echo -e "  ${YELLOW}[!] Could not fetch the ICD wrapper — leaving Mali on software${NC}"
+        echo -e "  ${YELLOW}    rendering. You can retry later; nothing else was changed.${NC}"
+        return
+    fi
+
+    fetch_mali_angle_launcher
+
+    mkdir -p ~/.config
+    cat > ~/.config/linux-gpu-mali-angle.sh << 'ANGLEEOF'
+# Experimental Mali hardware acceleration via ANGLE -> Vulkan (no root required)
+# Third-party: github.com/ar37-rs/virgl-angle — not an official Mesa driver.
+# Applied per-app, not desktop-wide: the desktop itself still renders via
+# software Zink/LLVMpipe for stability; only apps launched through
+# ~/vgl (or sourcing this file) get GPU acceleration.
+export MESA_NO_ERROR=1
+export LIBGL_ALWAYS_SOFTWARE=0
+export GALLIUM_DRIVER=virpipe
+ANGLEEOF
+    echo -e "  ${GREEN}[+] Wrote ~/.config/linux-gpu-mali-angle.sh${NC}"
+    if [ -f ~/vgl ]; then
+        echo -e "  ${GREEN}[+] Installed ~/vgl launcher — run '~/vgl <command>' to${NC}"
+        echo -e "  ${GREEN}    launch an app with Mali GPU acceleration.${NC}"
+    fi
+    echo -e "  ${YELLOW}[!] If an app crashes or renders incorrectly, launch it normally${NC}"
+    echo -e "  ${YELLOW}    (without ~/vgl) instead to fall back to software rendering.${NC}"
+    MALI_ANGLE_ENABLED="yes"
+}
+
+# Downloads the current mesa-vulkan-icd-wrapper .deb from the repo's "latest"
+# GitHub release and installs it. The asset filename is version-stamped and
+# changes between releases, so it's resolved through the GitHub Releases API
+# rather than hardcoded. Verifies the download is a non-empty .deb before
+# installing. Returns non-zero (leaving the system untouched) on any failure.
+fetch_mali_angle_wrapper() {
+    local api_url="https://api.github.com/repos/${MALI_ANGLE_REPO}/releases/tags/latest"
+    local deb_url
+    deb_url=$(curl -fsSL "$api_url" 2>/dev/null | \
+        grep -o '"browser_download_url": *"[^"]*mesa-vulkan-icd-wrapper[^"]*\.deb"' | \
+        head -1 | sed -E 's/.*"(https[^"]+)"/\1/')
+
+    if [ -z "$deb_url" ]; then
+        echo -e "  ${YELLOW}[!] Could not resolve the wrapper .deb from the GitHub API.${NC}"
+        return 1
+    fi
+
+    local tmp_deb
+    tmp_deb=$(mktemp --suffix=.deb) || return 1
+    if ! curl -fsSL "$deb_url" -o "$tmp_deb" 2>/dev/null; then
+        echo -e "  ${YELLOW}[!] Download failed: ${deb_url}${NC}"
+        rm -f "$tmp_deb"
+        return 1
+    fi
+
+    # Sanity check: a real .deb is an ar archive, not an HTML error page.
+    if ! file "$tmp_deb" 2>/dev/null | grep -qi "debian binary package\|ar archive"; then
+        echo -e "  ${YELLOW}[!] Downloaded file doesn't look like a valid .deb — aborting.${NC}"
+        rm -f "$tmp_deb"
+        return 1
+    fi
+
+    if ! dpkg -i "$tmp_deb" > /dev/null 2>&1; then
+        echo -e "  ${YELLOW}[!] dpkg failed to install the wrapper.${NC}"
+        rm -f "$tmp_deb"
+        return 1
+    fi
+    rm -f "$tmp_deb"
+    echo -e "  ${GREEN}[+] mesa-vulkan-icd-wrapper installed${NC}"
+    return 0
+}
+
+# Downloads the optional ~/vgl launcher script (per-app GPU switch helper).
+# Best-effort: acceleration still works without it via linux-gpu-mali-angle.sh,
+# so failure here does not abort setup.
+fetch_mali_angle_launcher() {
+    local vgl_url="https://github.com/${MALI_ANGLE_REPO}/raw/refs/heads/main/vgl"
+    if curl -fsSL "$vgl_url" -o ~/vgl 2>/dev/null && [ -s ~/vgl ]; then
+        chmod +x ~/vgl
+    else
+        rm -f ~/vgl
+        echo -e "  ${YELLOW}[!] Could not fetch the ~/vgl launcher (non-fatal).${NC}"
+    fi
 }
 
 # ============== STEP 6: AUDIO ==============
@@ -378,8 +591,13 @@ export MESA_LOADER_DRIVER_OVERRIDE=zink
 export TU_DEBUG=noconform
 export ZINK_DESCRIPTORS=lazy
 export MESA_VK_WSI_PRESENT_MODE=immediate
-[ -f /usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json ] && \
+if [ -f /usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json ]; then
     export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d.termux/freedreno_icd.aarch64.json
+elif [ -f /usr/share/vulkan/icd.d.termux/panfrost_icd.aarch64.json ]; then
+    # PanVK (Mali) — only reachable here when the proot bind mounted /dev/dri,
+    # i.e. the rooted panvk tier from setup_panvk_env().
+    export VK_ICD_FILENAMES=/usr/share/vulkan/icd.d.termux/panfrost_icd.aarch64.json
+fi
 export XDG_DATA_DIRS=/usr/share:/usr/local/share:\${XDG_DATA_DIRS}
 export PS1="\[\033[01;32m\]$SETUP_USERNAME@linux\[\033[00m\]:\[\033[01;34m\]\w\[\033[00m\]\$ "
 echo ""
@@ -562,6 +780,13 @@ export ZINK_DESCRIPTORS=lazy
 export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
 export XDG_CONFIG_DIRS=/data/data/com.termux/files/usr/etc/xdg:\${XDG_CONFIG_DIRS}
 EOF
+
+    if [ "$GPU_DRIVER" == "panvk" ]; then
+        echo "source ~/.config/linux-gpu-panvk.sh" >> ~/.config/linux-gpu.sh
+    fi
+    # mali_angle intentionally NOT sourced desktop-wide here — it's applied
+    # per-app (see step_mali_angle) so a bad app launch can't take the whole
+    # desktop session down with it.
 
     if [ "$DE_CHOICE" == "4" ]; then
         echo "export KWIN_COMPOSE=O2ES" >> ~/.config/linux-gpu.sh
@@ -964,6 +1189,9 @@ step_vnc_optional() {
             4) VNC_EXEC="exec startplasma-x11";;
         esac
 
+        VNC_PANVK_SOURCE=""
+        [ "$GPU_DRIVER" == "panvk" ] && VNC_PANVK_SOURCE="source ~/.config/linux-gpu-panvk.sh"
+
         cat > ~/.vnc/xstartup << VNCSTARTUP
 #!/data/data/com.termux/files/usr/bin/bash
 export MESA_NO_ERROR=1
@@ -975,6 +1203,7 @@ export TU_DEBUG=noconform
 export ZINK_DESCRIPTORS=lazy
 export XDG_DATA_DIRS=/data/data/com.termux/files/usr/share:\${XDG_DATA_DIRS}
 export XDG_CONFIG_DIRS=/data/data/com.termux/files/usr/etc/xdg:\${XDG_CONFIG_DIRS}
+$VNC_PANVK_SOURCE
 $VNC_EXEC
 VNCSTARTUP
         chmod +x ~/.vnc/xstartup
@@ -1031,9 +1260,22 @@ COMPLETE
 
     echo -e "${WHITE}[*] ${DE_NAME} desktop is ready.${NC}"
     echo ""
+    GPU_SUMMARY="Zink/LLVMpipe (software)"
+    case "$GPU_DRIVER" in
+        freedreno)  GPU_SUMMARY="Turnip/Zink (Adreno, hardware)" ;;
+        panvk)      GPU_SUMMARY="PanVK/Zink (Mali, hardware, root)" ;;
+        mali_angle)
+            if [ "$MALI_ANGLE_ENABLED" == "yes" ]; then
+                GPU_SUMMARY="ANGLE/Vulkan (Mali, hardware, experimental — run apps via ~/vgl)"
+            else
+                GPU_SUMMARY="Zink/LLVMpipe (software — Mali accel skipped)"
+            fi
+            ;;
+    esac
+
     echo -e "${CYAN}[*] Installed:${NC}"
     echo "    - Firefox, Git, Python 3"
-    echo "    - GPU Acceleration (Turnip/Zink)"
+    echo "    - GPU Acceleration ($GPU_SUMMARY)"
     echo "    - Proot Linux Container + App Bridge"
     echo "    - Modern Dark XFCE Theme (Adwaita + Dracula terminal)"
     echo ""

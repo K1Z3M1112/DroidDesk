@@ -279,6 +279,7 @@ class MainActivity : FlutterActivity() {
                 // ── Native Termux desktop install (non-root fallback) ──
                 "installDesktopNative" -> {
                     val desktopEnv = call.argument<String>("de") ?: "xfce4"
+                    val enableMaliAccel = call.argument<Boolean>("enableExperimentalMaliAccel") ?: false
                     thread {
                         linuxRuntime.setInstallLogSink { chunk ->
                             runOnUiThread {
@@ -289,6 +290,7 @@ class MainActivity : FlutterActivity() {
                         try {
                             val ok = linuxRuntime.installDesktopEnvironmentNative(
                                 desktopEnv,
+                                enableMaliAccel,
                             ) { progress, status ->
                                 runOnUiThread {
                                     MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL).invokeMethod(
