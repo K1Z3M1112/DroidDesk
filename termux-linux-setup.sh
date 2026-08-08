@@ -150,9 +150,12 @@ $(getprop ro.soc.model 2>/dev/null)"
         fi
 
     else
-        GPU_DRIVER="zink_native"
-        echo -e "  [*] GPU    : ${WHITE}Unrecognized GPU — Zink/LLVMpipe (software) fallback${NC}"
-        echo -e "${YELLOW}      [!] Recommend XFCE or LXQt for best performance.${NC}"
+        echo -e "  [*] GPU    : ${RED}Not recognized — no hardware acceleration path found${NC}"
+        echo -e "${RED}      [!] Software rendering (LLVMpipe) has been disabled in this${NC}"
+        echo -e "${RED}          build. DroidDesk requires GPU acceleration and will not${NC}"
+        echo -e "${RED}          continue on an unsupported chipset.${NC}"
+        echo -e "${YELLOW}      [!] Detected strings: ${GPU_PROBE_LC}${NC}"
+        exit 1
     fi
     echo ""
 
@@ -337,12 +340,8 @@ step_mali_angle() {
     echo -e "  ${YELLOW}    package). DroidDesk does not maintain this project.${NC}"
     echo ""
 
-    REPLY=""
-    read -p "  Install it and enable experimental Mali GPU accel? [y/N]: " REPLY
-    if [[ ! "$REPLY" =~ ^[Yy]$ ]]; then
-        echo -e "  ${WHITE}[*] Skipped — apps will use software (LLVMpipe) rendering.${NC}"
-        return
-    fi
+    echo -e "  ${WHITE}[*] Software rendering is disabled in this build — installing${NC}"
+    echo -e "  ${WHITE}    the Mali GPU path automatically (no opt-out).${NC}"
 
     install_pkg "virglrenderer" "VirGL Renderer"
     install_pkg "virglrenderer-android" "VirGL Renderer (Android)"
@@ -358,9 +357,10 @@ step_mali_angle() {
     echo -e "  ${CYAN}[*] Fetching mesa-vulkan-icd-wrapper from ${MALI_ANGLE_REPO}...${NC}"
     fetch_mali_angle_wrapper
     if [ $? -ne 0 ]; then
-        echo -e "  ${YELLOW}[!] Could not fetch the ICD wrapper — leaving Mali on software${NC}"
-        echo -e "  ${YELLOW}    rendering. You can retry later; nothing else was changed.${NC}"
-        return
+        echo -e "  ${RED}[!] Could not fetch the Mali GPU ICD wrapper.${NC}"
+        echo -e "  ${RED}    Software rendering is disabled in this build, so setup${NC}"
+        echo -e "  ${RED}    cannot continue. Check your network connection and re-run.${NC}"
+        exit 1
     fi
 
     fetch_mali_angle_launcher
@@ -381,8 +381,6 @@ ANGLEEOF
         echo -e "  ${GREEN}[+] Installed ~/vgl launcher — run '~/vgl <command>' to${NC}"
         echo -e "  ${GREEN}    launch an app with Mali GPU acceleration.${NC}"
     fi
-    echo -e "  ${YELLOW}[!] If an app crashes or renders incorrectly, launch it normally${NC}"
-    echo -e "  ${YELLOW}    (without ~/vgl) instead to fall back to software rendering.${NC}"
     MALI_ANGLE_ENABLED="yes"
 }
 
@@ -689,14 +687,14 @@ for desktop_file in "$PROOT_APPS"/*.desktop; do
 
     if echo "$appname" | grep -qi "blender"; then
         APP_CMD="$CLEAN_EXEC"
-        if "$PROOT_BIN" login "$PROOT_DISTRO" -- \
+        if ! "$PROOT_BIN" login "$PROOT_DISTRO" -- \
                 ldconfig -p 2>/dev/null | grep -q "libvulkan.so.1"; then
-            EXTRA_ENV="export GALLIUM_DRIVER=zink; export MESA_GL_VERSION_OVERRIDE=4.6;"
-            echo "  [+] Blender: Zink GPU mode"
-        else
-            EXTRA_ENV="export LIBGL_ALWAYS_SOFTWARE=1; export GALLIUM_DRIVER=llvmpipe; export MESA_GL_VERSION_OVERRIDE=4.5;"
-            echo "  [!] Blender: Software mode (install libvulkan1 in proot for GPU)"
+            echo "  [*] Blender: libvulkan1 missing in proot — installing for GPU mode..."
+            "$PROOT_BIN" login "$PROOT_DISTRO" -- \
+                apt-get install -y -q libvulkan1 > /dev/null 2>&1
         fi
+        EXTRA_ENV="export GALLIUM_DRIVER=zink; export MESA_GL_VERSION_OVERRIDE=4.6;"
+        echo "  [+] Blender: Zink GPU mode (software rendering disabled)"
     fi
 
     cat > "$wrapper" << WRAPEOF
@@ -1260,17 +1258,11 @@ COMPLETE
 
     echo -e "${WHITE}[*] ${DE_NAME} desktop is ready.${NC}"
     echo ""
-    GPU_SUMMARY="Zink/LLVMpipe (software)"
+    GPU_SUMMARY="Turnip/Zink (Adreno, hardware)"
     case "$GPU_DRIVER" in
         freedreno)  GPU_SUMMARY="Turnip/Zink (Adreno, hardware)" ;;
         panvk)      GPU_SUMMARY="PanVK/Zink (Mali, hardware, root)" ;;
-        mali_angle)
-            if [ "$MALI_ANGLE_ENABLED" == "yes" ]; then
-                GPU_SUMMARY="ANGLE/Vulkan (Mali, hardware, experimental — run apps via ~/vgl)"
-            else
-                GPU_SUMMARY="Zink/LLVMpipe (software — Mali accel skipped)"
-            fi
-            ;;
+        mali_angle) GPU_SUMMARY="ANGLE/Vulkan (Mali, hardware, experimental — run apps via ~/vgl)" ;;
     esac
 
     echo -e "${CYAN}[*] Installed:${NC}"
